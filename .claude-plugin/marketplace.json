@@ -1,0 +1,14 @@
+{
+  "name": "double-bang",
+  "owner": {
+    "name": "lucasbertoni"
+  },
+  "description": "The double-bang mod for Claude Code: private !! shell commands",
+  "plugins": [
+    {
+      "name": "double-bang",
+      "source": "./",
+      "description": "!!<command> runs a shell command without sharing it with Claude; share it later if you want"
+    }
+  ]
+}

@@ -1,0 +1,10 @@
+{
+  "name": "double-bang",
+  "version": "0.2.0",
+  "description": "!!<command> runs a shell command without sharing it with Claude; share it later if you want",
+  "author": {
+    "name": "lucasbertoni"
+  },
+  "repository": "https://github.com/lucasbertoni/double-bang",
+  "types": "./types/index.d.ts"
+}

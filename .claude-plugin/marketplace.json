@@ -3,12 +3,12 @@
   "owner": {
     "name": "lucasbertoni"
   },
-  "description": "The double-bang mod for Claude Code: private !! shell commands",
+  "description": "The double-bang mod for Claude Code: a sidecar terminal outside the conversation",
   "plugins": [
     {
       "name": "double-bang",
       "source": "./",
-      "description": "!!<command> runs a shell command without sharing it with Claude; share it later if you want"
+      "description": "A side terminal pane: run shell commands outside the conversation, share a run with Claude when you want"
     }
   ]
 }

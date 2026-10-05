@@ -1,170 +1,224 @@
 import { atom, read, update } from 'claude-code'
 import type { EngineInterface, Register } from 'claude-code'
 
-import type { BangRun } from '../types'
+import type { SidecarRun } from '../types'
 
-// `!` on an empty prompt switches to shell mode and is consumed; a second `!`
-// typed first in the shell-mode draft arms the next command as private. The
-// engine still runs it, and its two transcript rows are rewritten to stubs
-// before the model or the transcript file reads them.
+// A side terminal in a pane. Commands typed there run in a process the plugin
+// starts itself, never through the engine's `!`, so nothing about them enters
+// the conversation until the person shares a run.
 
-const isArmed = atom({ plugin: 'double-bang', key: 'isArmed' } as const, false)
-const last = atom({ plugin: 'double-bang', key: 'last' } as const, null)
-const isHidden = atom({ plugin: 'double-bang', key: 'isHidden' } as const, false)
-const isExpanded = atom({ plugin: 'double-bang', key: 'isExpanded' } as const, false)
+const PANE = 'sidecar'
+const TITLE = 'Sidecar'
 
-const PREVIEW_LINES = 12
-const EXPANDED_LINES = 200
-const SHARE_LIMIT = 30000
-const INPUT_STUB = '(private shell command)'
-const OUTPUT_STUB = '(output withheld)'
+const runs = atom({ plugin: 'double-bang', key: 'runs' } as const, [])
+const cwdAtom = atom({ plugin: 'double-bang', key: 'cwd' } as const, null)
 
-function tagged(text: string, tag: string): string {
-  const m = new RegExp(`<${tag}>([\\s\\S]*?)</${tag}>`).exec(text)
-  return m?.[1] ?? ''
-}
+const KEPT_RUNS = 20
+const OUTPUT_LIMIT = 200_000
+const SHARE_LIMIT = 30_000
+const ANSI = /\x1b\[[0-?]*[ -/]*[@-~]|\x1b\][^\x07]*\x07/g
 
-async function arm($: EngineInterface, on: boolean) {
-  await update($, isArmed, () => on)
-  $.ui.status(on ? '!! private: the next shell command stays out of the conversation' : undefined)
-}
+type Shell = { kind: 'bash' | 'pwsh'; path: string }
 
-async function share($: EngineInterface): Promise<string> {
-  const r = await read($, last)
-  if (r === null || !r.isDone) {
-    return 'Nothing to share yet.'
-  }
-  if (r.isShared) {
-    return 'Already shared.'
+// The module's own: a reload starts them over, and kills what was running.
+let shell: Shell | null = null
+const running = new Map<string, AsyncGenerator<unknown, unknown>>()
+let nextId = 0
+
+// The shell Claude Code's own `!` runs in: Git Bash on Windows (PowerShell
+// where Git is missing), bash everywhere else.
+async function findShell($: EngineInterface): Promise<Shell> {
+  if (shell !== null) {
+    return shell
   }
 
-  const cap = (s: string) =>
-    s.length > SHARE_LIMIT ? `${s.slice(0, SHARE_LIMIT)}\n[... ${s.length - SHARE_LIMIT} more characters cut]` : s
+  if ((await $.env.get('OS')) !== 'Windows_NT') {
+    shell = { kind: 'bash', path: '/bin/bash' }
+    return shell
+  }
+
+  const bash = await gitBash($)
+  shell = bash === null ? { kind: 'pwsh', path: 'powershell.exe' } : { kind: 'bash', path: bash }
+
+  return shell
+}
+
+// The `bash` on PATH is usually WSL's, so look where Claude Code looks.
+async function gitBash($: EngineInterface): Promise<string | null> {
+  const set = await $.env.get('CLAUDE_CODE_GIT_BASH_PATH')
+  if (set !== undefined && set !== '') {
+    return set
+  }
+
+  const standard = 'C:\\Program Files\\Git\\bin\\bash.exe'
+  if (await $.fs.exists(standard)) {
+    return standard
+  }
+
+  const r = await $.process.run(['where.exe', 'git']).catch(() => null)
+  const git = r?.stdout.split(/\r?\n/).find(line => /\\cmd\\git\.exe$/i.test(line.trim()))
+  const beside = git?.trim().replace(/\\cmd\\git\.exe$/i, '\\bin\\bash.exe')
+
+  return beside !== undefined && (await $.fs.exists(beside)) ? beside : null
+}
+
+function argv(sh: Shell, command: string): string[] {
+  return sh.kind === 'pwsh' ? [sh.path, '-NoLogo', '-Command', command] : [sh.path, '-c', command]
+}
+
+// `cd` runs in the shell too, which reports where it landed; later runs start there.
+function cdTarget(command: string): string | null {
+  const m = /^\s*(?:cd|Set-Location|sl|chdir)(?:\s+(.*))?$/i.exec(command)
+  return m === null ? null : (m[1] ?? '').trim()
+}
+
+async function patch($: EngineInterface, id: string, fn: (r: SidecarRun) => SidecarRun) {
+  await update($, runs, list => list.map(r => (r.id === id ? fn(r) : r)))
+}
+
+async function execute($: EngineInterface, command: string) {
+  if (command.trim() === '') {
+    return
+  }
+
+  const sh = await findShell($)
+  const cwd = (await read($, cwdAtom)) ?? (await $.session.cwd())
+  const id = `run-${Date.now()}-${nextId++}`
+  const run: SidecarRun = { id, command, cwd, output: '', exitCode: null, isRunning: true, isShared: false }
+  await update($, runs, list => [...list, run].slice(-KEPT_RUNS))
+
+  const target = cdTarget(command)
+  const line =
+    target === null
+      ? command
+      : sh.kind === 'pwsh'
+        ? `Set-Location ${target === '' ? '~' : target}; (Get-Location).Path`
+        : `cd ${target} && ${sh.path.toLowerCase().endsWith('.exe') ? 'pwd -W' : 'pwd'}`
+
+  let output = ''
+  let code: number | null = null
+  try {
+    const stream = $.process.spawn({ argv: argv(sh, line), cwd })
+    running.set(id, stream)
+    for await (const { text } of stream) {
+      output = (output + text.replace(ANSI, '')).slice(-OUTPUT_LIMIT)
+      await patch($, id, r => ({ ...r, output }))
+    }
+    code = (await stream.result).code
+  } catch (err) {
+    output += `${output === '' ? '' : '\n'}${String(err)}`
+  } finally {
+    running.delete(id)
+  }
+
+  if (target !== null && code === 0) {
+    const landed = output.trim().split(/\r?\n/).pop() ?? ''
+    if (landed !== '') {
+      await update($, cwdAtom, () => landed)
+    }
+  }
+  await patch($, id, r => ({ ...r, output, exitCode: code, isRunning: false }))
+}
+
+function stop(id: string) {
+  void running.get(id)?.return(undefined)
+}
+
+async function share($: EngineInterface, id: string) {
+  const r = (await read($, runs)).find(one => one.id === id)
+  if (r === undefined || r.isRunning || r.isShared) {
+    return
+  }
+
+  const out = r.output.length > SHARE_LIMIT ? `${r.output.slice(-SHARE_LIMIT)}\n[earlier output cut]` : r.output
   const text = [
-    'The user ran this shell command privately with `!!` (it was withheld at the time) and is now sharing it with you.',
+    'The user ran this shell command in a side terminal, outside the conversation, and is now sharing it with you.',
     `<bash-input>${r.command}</bash-input>`,
-    `<bash-stdout>${cap(r.stdout)}</bash-stdout><bash-stderr>${cap(r.stderr)}</bash-stderr>`,
+    `<cwd>${r.cwd}</cwd>`,
+    `<exit-code>${r.exitCode ?? 'stopped'}</exit-code>`,
+    `<output>${out}</output>`,
   ].join('\n')
 
   await $.session.append({ message: { type: 'user', content: [{ type: 'text', text }] } })
-  await update($, last, cur => (cur?.id === r.id ? { ...cur, isShared: true } : cur))
-  $.ui.toast('!! output shared: Claude reads it with your next message')
-
-  return 'Shared.'
+  await patch($, id, one => ({ ...one, isShared: true }))
+  $.ui.toast('Sidecar run shared: Claude reads it with your next message')
 }
 
 export const register: Register = on => {
   on('session.start', async ($, e, next) => {
-    await $.command.register({
-      name: 'bang-share',
-      description: 'Share the last !! command and its output with Claude',
-    })
+    await $.command.register({ name: 'sidecar', description: 'Open the sidecar terminal pane' })
+    // Unasked, the pane seats only in a wide terminal; /sidecar opens it anywhere.
+    void $.ui.open({ id: PANE, title: TITLE })
 
     return next(e)
   })
 
-  on('command.run', { command: 'bang-share' }, async $ => ({ text: await share($) }))
+  on('command.run', { command: 'sidecar' }, async $ => {
+    await $.ui.open({ id: PANE, title: TITLE, focus: true })
 
-  on('prompt.edit', async ($, e, next) => {
-
-    // The second `!`: first in an empty shell-mode draft. Take it out of the
-    // command and arm instead.
-    if (e.text === '' && e.inputText.startsWith('!')) {
-      await arm($, true)
-      const rest = e.inputText.slice(1)
-      return rest === '' ? { text: e.text, cursor: e.cursor } : next({ ...e, inputText: rest })
-    }
-    // Backspace on an empty draft leaves shell mode, and the private mark with it.
-    if (e.text === '' && e.inputText === '' && e.start === e.end && (await read($, isArmed))) {
-      await arm($, false)
-    }
-
-    return next(e)
+    return {}
   })
 
-  on('prompt.submit', async ($, e, next) => {
-    // A plain prompt means the person left shell mode.
-    if (await read($, isArmed)) {
-      await arm($, false)
+  on('ui.render', { component: 'Pane', requestId: PANE }, async ($, e) => {
+    const elements = $.ui.resolve(e)
+    // Mobile draws no text field; commands are typed where the CLI runs.
+    if (!('Input' in elements)) {
+      return <elements.Text dimColor>The sidecar runs commands from the terminal or desktop app.</elements.Text>
     }
-
-    return next(e)
-  })
-
-  on('session.append', { door: 'command' }, async ($, e, next) => {
-    const text = e.message.content.map(b => (b.type === 'text' ? b.text : '')).join('')
-
-    if (e.message.type !== 'user' || !(await read($, isArmed))) {
-      return next(e)
-    }
-
-    if (text.startsWith('<bash-input>')) {
-      const run: BangRun = {
-        id: e.uuid,
-        command: tagged(text, 'bash-input'),
-        stdout: '',
-        stderr: '',
-        isDone: false,
-        isShared: false,
-      }
-      await update($, last, () => run)
-      await update($, isHidden, () => false)
-      await update($, isExpanded, () => false)
-
-      return next({ ...e, message: { ...e.message, content: [{ type: 'text', text: INPUT_STUB }] } })
-    }
-
-    if (text.startsWith('<bash-stdout>') || text.startsWith('<bash-stderr>')) {
-      await update($, last, cur =>
-        cur === null || cur.isDone
-          ? cur
-          : { ...cur, stdout: tagged(text, 'bash-stdout'), stderr: tagged(text, 'bash-stderr'), isDone: true },
-      )
-      await arm($, false)
-
-      return next({ ...e, message: { ...e.message, content: [{ type: 'text', text: OUTPUT_STUB }] } })
-    }
-
-    return next(e)
-  })
-
-  on('ui.render', { component: 'AbovePrompt' }, async ($, e, next) => {
-    const r = await read($, last)
-    if (r === null || e.props.hasSurvey || (await read($, isHidden))) {
-      return next(e)
-    }
-
-    const { Box, Button, Text } = $.ui.resolve(e)
-    const expanded = await read($, isExpanded)
+    const { Box, Button, Input, Text } = elements
+    const list = await read($, runs)
+    const cwd = (await read($, cwdAtom)) ?? (await $.session.cwd())
     const width = Math.max(20, e.props.bodyColumns)
-    const output = [r.stdout, r.stderr].filter(Boolean).join('\n').replace(/\s+$/, '')
-    const lines = output === '' ? [] : output.split(/\r?\n/)
-    const shown = lines.slice(-(expanded ? EXPANDED_LINES : PREVIEW_LINES))
-    const hiddenCount = lines.length - shown.length
-    const status = !r.isDone ? 'running...' : r.isShared ? 'shared with Claude' : 'not shared'
+    // Rows left for output once the cwd line, the field and each run's
+    // header and buttons are drawn.
+    let room = Math.max(4, (e.viewport?.rows ?? 24) - 4)
+
+    const shown: { run: SidecarRun; lines: string[] }[] = []
+    for (const run of [...list].reverse()) {
+      if (room <= 2) {
+        break
+      }
+      room -= 2
+      const all = run.output.replace(/\s+$/, '').split(/\r?\n/).filter((l, i, a) => a.length > 1 || l !== '')
+      const lines = all.slice(-Math.max(0, room))
+      room -= lines.length
+      shown.unshift({ run, lines })
+    }
 
     return (
       <Box flexDirection="column" width={width}>
-        <Box>
-          <Text bold>{`!! ${r.command}`.slice(0, width - 24)}</Text>
-          <Text dimColor>
-            {'  '}
-            {status}
-          </Text>
-        </Box>
-        {hiddenCount > 0 && <Text dimColor>... {hiddenCount} earlier lines</Text>}
-        {shown.map(line => (
-          <Text>{line.slice(0, width)}</Text>
+        <Text dimColor>{cwd.slice(-width)}</Text>
+        {shown.map(({ run, lines }) => (
+          <Box key={run.id} flexDirection="column">
+            <Box>
+              <Text bold color="warning">{`$ ${run.command}`.slice(0, width - 16)}</Text>
+              <Text dimColor>
+                {'  '}
+                {run.isRunning ? 'running' : run.exitCode === 0 ? 'ok' : `exit ${run.exitCode ?? 'stopped'}`}
+                {run.isShared ? ', shared' : ''}
+              </Text>
+            </Box>
+            {lines.map(l => (
+              <Text>{l.slice(0, width)}</Text>
+            ))}
+            <Box>
+              {run.isRunning && <Button key={`stop-${run.id}`} label="Stop" onPress={() => stop(run.id)} />}
+              {!run.isRunning && !run.isShared && (
+                <Button key={`share-${run.id}`} label="Share with Claude" onPress={() => share($, run.id)} />
+              )}
+            </Box>
+          </Box>
         ))}
-        <Box>
-          {r.isDone && !r.isShared && (
-            <Button key="share" label="Share with Claude" variant="primary" onPress={() => void share($)} />
-          )}
-          {lines.length > PREVIEW_LINES && (
-            <Button key="expand" label={expanded ? 'Less' : 'More'} onPress={() => update($, isExpanded, v => !v)} />
-          )}
-          <Button key="hide" label="Dismiss" onPress={() => update($, isHidden, () => true)} />
-        </Box>
+        <Input
+          key="command"
+          label="$ "
+          placeholder="command, runs outside the conversation"
+          submitLabel="run"
+          value=""
+          autoFocus
+          onSubmit={value => execute($, value)}
+        />
+        {list.length > 0 && <Button key="clear" label="Clear" onPress={() => update($, runs, () => [])} />}
       </Box>
     )
   })

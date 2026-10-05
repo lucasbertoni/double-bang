@@ -1,19 +1,18 @@
-export type BangRun = {
+export type SidecarRun = {
   id: string
   command: string
-  stdout: string
-  stderr: string
-  isDone: boolean
+  cwd: string
+  output: string
+  exitCode: number | null
+  isRunning: boolean
   isShared: boolean
 }
 
 declare module 'claude-code' {
   interface PluginState {
     'double-bang': {
-      isArmed: boolean
-      last: BangRun | null
-      isHidden: boolean
-      isExpanded: boolean
+      runs: SidecarRun[]
+      cwd: string | null
     }
   }
 }

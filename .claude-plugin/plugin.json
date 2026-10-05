@@ -1,7 +1,7 @@
 {
   "name": "double-bang",
-  "version": "0.2.0",
-  "description": "!!<command> runs a shell command without sharing it with Claude; share it later if you want",
+  "version": "0.3.0",
+  "description": "A side terminal pane: run shell commands outside the conversation, share a run with Claude when you want",
   "author": {
     "name": "lucasbertoni"
   },

@@ -1,16 +1,18 @@
 # double-bang
 
-A Claude Code mod that adds `!!`: run a shell command from the prompt without sharing it with Claude.
+A Claude Code mod that adds a sidecar terminal: a pane where you run shell commands outside the conversation.
 
-Claude Code's `!` runs a command and puts the command and its whole output in the conversation, where it costs tokens on every later turn. `!!` runs it the same way, but the conversation keeps only two short placeholders, `(private shell command)` and `(output withheld)`. The real output stays in a band above the prompt, with a **Share with Claude** button for when you do want Claude to see it.
+Claude Code's `!` runs a command and puts the command and its whole output in the conversation, where it costs tokens on every later turn. The sidecar runs commands in a process of its own, so neither the command nor its output reaches Claude. When you do want Claude to see a run, **Share with Claude** adds it to the conversation.
 
 ## Usage
 
-- `!!<command>`: type `!` (switches to shell mode), then `!` again, then the command. The status line shows `!! private` once armed.
-- **Share with Claude** in the band, or `/bang-share`: adds the last `!!` command and its output to the conversation as a note Claude reads with your next message. Sharing starts no turn by itself. Prefer the button: a slash command's own output line also reaches Claude.
-- **Dismiss** hides the band; **More** shows up to 200 lines.
+- The pane opens by itself when a session starts in a terminal at least 144 columns wide. Anywhere else, `/sidecar` opens it (the slash command leaves a small trace in the conversation, once).
+- Type a command in the pane's field and press Enter. Output streams into the pane with the exit code.
+- `cd` works: later commands start in the folder it landed in.
+- **Stop** ends a running command; **Share with Claude** adds a finished run (command, folder, exit code, output) to the conversation as a note Claude reads with your next message. Sharing starts no turn by itself.
+- **Clear** empties the pane.
 
-Backspacing out of shell mode, or sending a normal prompt, clears the private mark.
+Commands run in the shell Claude Code's own `!` uses: Git Bash on Windows (found via `CLAUDE_CODE_GIT_BASH_PATH`, then the standard install, then beside `git.exe`; PowerShell if there is none), bash elsewhere.
 
 ## Install
 
@@ -25,8 +27,9 @@ To try it from a clone without installing: `claude --plugin-dir <path to clone>`
 
 ## Limits
 
-- Claude can tell a private command ran (the two placeholders, about 10 tokens), but not what it was or what it printed.
-- The output band draws in the terminal and the Desktop Code tab only.
+- Commands run once and report what they printed: no interactive programs (`vim`, `ssh`, prompts that wait for input).
+- Each command runs in a fresh shell, so variables and aliases set in one run do not carry to the next; only the folder from `cd` does.
+- The pane runs commands from the terminal and the Desktop Code tab only.
 
 ## Development
 

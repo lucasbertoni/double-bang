@@ -1,7 +1,7 @@
 import { atom, read, update } from 'claude-code'
 import type { EngineInterface, Register } from 'claude-code'
 
-import type { SidecarRun } from '../types'
+import type { Delivery, SidecarRun } from '../types'
 
 // A side terminal in a pane. Commands typed there run in a process the plugin
 // starts itself, never through the engine's `!`, so nothing about them enters
@@ -12,6 +12,7 @@ const TITLE = 'Sidecar'
 
 const runs = atom({ plugin: 'double-bang', key: 'runs' } as const, [])
 const cwdAtom = atom({ plugin: 'double-bang', key: 'cwd' } as const, null)
+const deliveries = atom({ plugin: 'double-bang', key: 'deliveries' } as const, [])
 
 const KEPT_RUNS = 20
 const OUTPUT_LIMIT = 200_000
@@ -84,7 +85,7 @@ async function execute($: EngineInterface, command: string) {
   const sh = await findShell($)
   const cwd = (await read($, cwdAtom)) ?? (await $.session.cwd())
   const id = `run-${Date.now()}-${nextId++}`
-  const run: SidecarRun = { id, command, cwd, output: '', exitCode: null, isRunning: true, isShared: false }
+  const run: SidecarRun = { id, command, cwd, output: '', exitCode: null, isRunning: true, share: 'none' }
   await update($, runs, list => [...list, run].slice(-KEPT_RUNS))
 
   const target = cdTarget(command)
@@ -124,24 +125,38 @@ function stop(id: string) {
   void running.get(id)?.return(undefined)
 }
 
-async function share($: EngineInterface, id: string) {
-  const r = (await read($, runs)).find(one => one.id === id)
-  if (r === undefined || r.isRunning || r.isShared) {
-    return
-  }
+function summary(exit: string, lines: number): string {
+  return `${exit === '0' ? 'ok' : `exit ${exit}`}, ${lines} line${lines === 1 ? '' : 's'}`
+}
 
-  const out = r.output.length > SHARE_LIMIT ? `${r.output.slice(-SHARE_LIMIT)}\n[earlier output cut]` : r.output
-  const text = [
-    'The user ran this shell command in a side terminal, outside the conversation, and is now sharing it with you.',
+function outputLines(output: string): string[] {
+  const trimmed = output.replace(/\s+$/, '')
+  return trimmed === '' ? [] : trimmed.split(/\r?\n/)
+}
+
+function capped(output: string): string {
+  return output.length > SHARE_LIMIT ? `${output.slice(-SHARE_LIMIT)}\n[earlier output cut]` : output
+}
+
+// What Claude reads for one shared run, as context beside the prompt.
+function note(r: Delivery['runs'][number]): string {
+  return [
+    'The user ran this shell command in a side terminal, outside the conversation, and is sharing it with you.',
     `<bash-input>${r.command}</bash-input>`,
     `<cwd>${r.cwd}</cwd>`,
     `<exit-code>${r.exitCode ?? 'stopped'}</exit-code>`,
-    `<output>${out}</output>`,
+    `<output>${r.output}</output>`,
   ].join('\n')
+}
 
-  await $.session.append({ message: { type: 'user', content: [{ type: 'text', text }] } })
-  await patch($, id, one => ({ ...one, isShared: true }))
-  $.ui.toast('Sidecar run shared: Claude reads it with your next message')
+// A plugin's own rows and notices are not drawn in the transcript, so a
+// shared run waits for the person's next prompt: it rides along as context
+// and is drawn under that prompt's row.
+async function queue($: EngineInterface, id: string, on: boolean) {
+  await patch($, id, r => (r.isRunning || r.share === 'shared' ? r : { ...r, share: on ? 'queued' : 'none' }))
+  if (on) {
+    $.ui.toast('Queued: Claude gets this run with your next message')
+  }
 }
 
 export const register: Register = on => {
@@ -157,6 +172,65 @@ export const register: Register = on => {
     await $.ui.open({ id: PANE, title: TITLE, focus: true })
 
     return {}
+  })
+
+  on('prompt.submit', async ($, e, next) => {
+    const queued = (await read($, runs)).filter(r => r.share === 'queued')
+    if (queued.length === 0 || e.origin.kind !== 'composer' || e.text.startsWith('/')) {
+      return next(e)
+    }
+
+    const carried = queued.map(r => ({ command: r.command, cwd: r.cwd, exitCode: r.exitCode, output: capped(r.output) }))
+    const r = await next({ ...e, context: [...(e.context ?? []), ...carried.map(note)] })
+    if (r.drop !== undefined) {
+      return r
+    }
+
+    const ids = new Set(queued.map(one => one.id))
+    await update($, runs, list => list.map(one => (ids.has(one.id) ? { ...one, share: 'shared' as const } : one)))
+    await update($, deliveries, list => [...list, { prompt: e.text, runs: carried }].slice(-KEPT_RUNS))
+
+    return r
+  })
+
+  // The runs a prompt carried, under its row: one line each, whole under ctrl+o.
+  on('ui.render', { component: 'UserMessage', props: { origin: { kind: 'composer' } } }, async ($, e, next) => {
+    const delivery = (await read($, deliveries)).findLast(d => d.prompt.trim() === e.props.text.trim())
+    const drawn = await next(e)
+    if (delivery === undefined) {
+      return drawn
+    }
+
+    const { Box, Text } = $.ui.resolve(e)
+    return (
+      <Box flexDirection="column">
+        {drawn}
+        {delivery.runs.map(run => {
+          const lines = outputLines(run.output)
+          const head = (
+            <Box>
+              <Text color="warning">{'  ⇡ shared '}</Text>
+              <Text bold>{`$ ${run.command}`}</Text>
+              <Text dimColor>
+                {`  ${summary(String(run.exitCode ?? 'stopped'), lines.length)}${e.props.isExpanded ? '' : ' · ctrl+o to expand'}`}
+              </Text>
+            </Box>
+          )
+          if (!e.props.isExpanded) {
+            return head
+          }
+          return (
+            <Box flexDirection="column" borderStyle="round" borderDimColor paddingX={1} marginLeft={2}>
+              {head}
+              <Text dimColor>{run.cwd}</Text>
+              {lines.map(l => (
+                <Text>{l}</Text>
+              ))}
+            </Box>
+          )
+        })}
+      </Box>
+    )
   })
 
   on('ui.render', { component: 'Pane', requestId: PANE }, async ($, e) => {
@@ -195,7 +269,7 @@ export const register: Register = on => {
               <Text dimColor>
                 {'  '}
                 {run.isRunning ? 'running' : run.exitCode === 0 ? 'ok' : `exit ${run.exitCode ?? 'stopped'}`}
-                {run.isShared ? ', shared' : ''}
+                {run.share === 'queued' ? ', goes with your next message' : run.share === 'shared' ? ', shared' : ''}
               </Text>
             </Box>
             {lines.map(l => (
@@ -203,8 +277,11 @@ export const register: Register = on => {
             ))}
             <Box>
               {run.isRunning && <Button key={`stop-${run.id}`} label="Stop" onPress={() => stop(run.id)} />}
-              {!run.isRunning && !run.isShared && (
-                <Button key={`share-${run.id}`} label="Share with Claude" onPress={() => share($, run.id)} />
+              {!run.isRunning && run.share === 'none' && (
+                <Button key={`share-${run.id}`} label="Share with Claude" onPress={() => queue($, run.id, true)} />
+              )}
+              {run.share === 'queued' && (
+                <Button key={`unshare-${run.id}`} label="Don't share" onPress={() => queue($, run.id, false)} />
               )}
             </Box>
           </Box>
